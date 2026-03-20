@@ -853,7 +853,14 @@ async function main() {
     console.error("Indexify MCP Server running on stdio");
   } else {
     const app = express();
-    app.use(express.json());
+    app.use(express.json({ limit: "50mb" })); // large base64 file uploads
+
+    // Generous timeout for long-running Indexify operations (query, embedding, OCR)
+    const REQUEST_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+    app.use((_req, res, next) => {
+      res.setTimeout(REQUEST_TIMEOUT);
+      next();
+    });
 
     app.get("/health", (_req, res) => {
       res.json({ status: "ok", server: "indexify-mcp", version: "1.0.0" });
@@ -955,7 +962,7 @@ async function main() {
       await session.transport.handlePostMessage(req, res, req.body);
     });
 
-    app.listen(PORT, () => {
+    const httpServer = app.listen(PORT, () => {
       console.log(`🚀 Indexify MCP Server running on http://localhost:${PORT}`);
       console.log(`   Streamable HTTP: http://localhost:${PORT}/mcp`);
       console.log(`   Legacy SSE:      http://localhost:${PORT}/sse`);
@@ -963,6 +970,11 @@ async function main() {
       console.log(`   Connected to:    ${INDEXIFY_BASE_URL}`);
       console.log(`   Auth API:        ${INDEXIFY_AUTH_BASE_URL}`);
     });
+
+    // Set server-level timeouts to match REQUEST_TIMEOUT
+    httpServer.timeout = REQUEST_TIMEOUT;
+    httpServer.keepAliveTimeout = REQUEST_TIMEOUT;
+    httpServer.headersTimeout = REQUEST_TIMEOUT + 1000;
   }
 }
 

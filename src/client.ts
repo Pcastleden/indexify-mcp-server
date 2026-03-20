@@ -72,6 +72,7 @@ export class IndexifyClient {
       method,
       headers: { ...this.headers(), ...extraHeaders },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(4 * 60 * 1000), // 4 min timeout for long Indexify operations
     });
 
     if (!res.ok) {
@@ -210,6 +211,7 @@ export class IndexifyClient {
         "content-type": `multipart/form-data; boundary=${boundary}`,
       },
       body,
+      signal: AbortSignal.timeout(4 * 60 * 1000), // 4 min timeout for large uploads
     });
 
     if (!res.ok) {
