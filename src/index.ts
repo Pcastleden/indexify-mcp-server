@@ -10,7 +10,9 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 import { z } from "zod";
 import { IndexifyClient } from "./client.js";
@@ -857,25 +859,86 @@ async function main() {
       res.json({ status: "ok", server: "indexify-mcp", version: "1.0.0" });
     });
 
-    // Each SSE session gets its own McpServer instance
-    const sessions: Record<string, { server: McpServer; transport: SSEServerTransport }> = {};
+    // ── Streamable HTTP transport (modern MCP clients) ────────────
+    // Each session gets its own McpServer + StreamableHTTP transport
+    const streamableSessions: Record<string, { server: McpServer; transport: StreamableHTTPServerTransport }> = {};
+
+    // Handle all methods on /mcp
+    app.all("/mcp", async (req, res) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+      if (req.method === "POST") {
+        // Check if this is an init request (new session)
+        if (!sessionId || !streamableSessions[sessionId]) {
+          // Only allow initialize requests to create new sessions
+          if (isInitializeRequest(req.body)) {
+            const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+            const server = createServer();
+
+            await server.connect(transport);
+            await transport.handleRequest(req, res, req.body);
+
+            const newSessionId = transport.sessionId;
+            if (newSessionId) {
+              streamableSessions[newSessionId] = { server, transport };
+              console.log(`[MCP] Session ${newSessionId} created (${Object.keys(streamableSessions).length} active)`);
+
+              // Clean up on close
+              transport.onclose = () => {
+                console.log(`[MCP] Session ${newSessionId} closed`);
+                delete streamableSessions[newSessionId];
+              };
+            }
+          } else if (!sessionId) {
+            res.status(400).json({ error: "Missing mcp-session-id header. Send an initialize request first." });
+          } else {
+            res.status(404).json({ error: "Session not found. It may have expired." });
+          }
+          return;
+        }
+
+        // Existing session
+        await streamableSessions[sessionId].transport.handleRequest(req, res, req.body);
+      } else if (req.method === "GET") {
+        // SSE stream for server-to-client notifications
+        if (!sessionId || !streamableSessions[sessionId]) {
+          res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
+          return;
+        }
+        await streamableSessions[sessionId].transport.handleRequest(req, res);
+      } else if (req.method === "DELETE") {
+        // Session termination
+        if (sessionId && streamableSessions[sessionId]) {
+          console.log(`[MCP] Session ${sessionId} terminated by client`);
+          await streamableSessions[sessionId].transport.handleRequest(req, res);
+          await streamableSessions[sessionId].server.close();
+          delete streamableSessions[sessionId];
+        } else {
+          res.status(404).json({ error: "Session not found" });
+        }
+      } else {
+        res.status(405).json({ error: "Method not allowed" });
+      }
+    });
+
+    // ── Legacy SSE transport (older MCP clients) ─────────────────
+    const sseSessions: Record<string, { server: McpServer; transport: SSEServerTransport }> = {};
 
     app.get("/sse", async (req, res) => {
-      // Keep-alive headers to prevent proxy/load-balancer from closing the SSE stream
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
-      res.setHeader("X-Accel-Buffering", "no"); // nginx/Railway proxy buffering off
+      res.setHeader("X-Accel-Buffering", "no");
 
       const transport = new SSEServerTransport("/messages", res);
       const sessionId = transport.sessionId;
       const server = createServer();
-      sessions[sessionId] = { server, transport };
-      console.log(`[SSE] Session ${sessionId} connected (${Object.keys(sessions).length} active)`);
+      sseSessions[sessionId] = { server, transport };
+      console.log(`[SSE] Session ${sessionId} connected (${Object.keys(sseSessions).length} active)`);
 
       res.on("close", () => {
         console.log(`[SSE] Session ${sessionId} disconnected`);
         server.close().catch(() => {});
-        delete sessions[sessionId];
+        delete sseSessions[sessionId];
       });
 
       await server.connect(transport);
@@ -883,9 +946,9 @@ async function main() {
 
     app.post("/messages", async (req, res) => {
       const sessionId = req.query.sessionId as string;
-      const session = sessions[sessionId];
+      const session = sseSessions[sessionId];
       if (!session) {
-        console.error(`[POST /messages] No session for ${sessionId}. Active sessions: ${Object.keys(sessions).join(", ") || "none"}`);
+        console.error(`[POST /messages] No session for ${sessionId}. Active: ${Object.keys(sseSessions).join(", ") || "none"}`);
         res.status(400).json({ error: "No active SSE session for this sessionId" });
         return;
       }
@@ -893,12 +956,12 @@ async function main() {
     });
 
     app.listen(PORT, () => {
-      console.log(`🚀 Indexify MCP Server (SSE) running on http://localhost:${PORT}`);
-      console.log(`   SSE endpoint: http://localhost:${PORT}/sse`);
-      console.log(`   Messages endpoint: http://localhost:${PORT}/messages`);
-      console.log(`   Health check: http://localhost:${PORT}/health`);
-      console.log(`   Connected to: ${INDEXIFY_BASE_URL}`);
-      console.log(`   Auth API: ${INDEXIFY_AUTH_BASE_URL}`);
+      console.log(`🚀 Indexify MCP Server running on http://localhost:${PORT}`);
+      console.log(`   Streamable HTTP: http://localhost:${PORT}/mcp`);
+      console.log(`   Legacy SSE:      http://localhost:${PORT}/sse`);
+      console.log(`   Health check:    http://localhost:${PORT}/health`);
+      console.log(`   Connected to:    ${INDEXIFY_BASE_URL}`);
+      console.log(`   Auth API:        ${INDEXIFY_AUTH_BASE_URL}`);
     });
   }
 }
