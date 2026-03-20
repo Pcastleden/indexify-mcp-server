@@ -50,14 +50,14 @@ export class IndexifyClient {
 
   private headers(): Record<string, string> {
     return {
-      authorization: `Bearer ${this.apiKey}`,
+      authorization: this.apiKey.startsWith("Basic ") ? this.apiKey : `Bearer ${this.apiKey}`,
       "content-type": "application/json",
     };
   }
 
   private authHeaders(): Record<string, string> {
     return {
-      authorization: `Bearer ${this.apiKey}`,
+      authorization: this.apiKey.startsWith("Basic ") ? this.apiKey : `Bearer ${this.apiKey}`,
     };
   }
 
