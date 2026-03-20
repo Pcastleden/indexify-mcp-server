@@ -659,11 +659,7 @@ async function main() {
   } else {
     // Remote SSE mode — for Dreamer, web clients, etc.
     const app = express();
-    // Only parse JSON for non-MCP message routes — the SSE transport reads the raw body itself
-    app.use((req, res, next) => {
-      if (req.path === "/messages") return next();
-      express.json()(req, res, next);
-    });
+    app.use(express.json());
 
     // Health check
     app.get("/health", (_req, res) => {
@@ -692,7 +688,7 @@ async function main() {
         res.status(400).json({ error: "No active SSE session for this sessionId" });
         return;
       }
-      await transport.handlePostMessage(req, res);
+      await transport.handlePostMessage(req, res, req.body);
     });
 
     app.listen(PORT, () => {
