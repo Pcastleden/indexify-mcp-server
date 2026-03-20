@@ -14,11 +14,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import express from "express";
 import { z } from "zod";
 import { IndexifyClient } from "./client.js";
+import { IndexifyAuthClient } from "./auth-client.js";
 
 // ── Configuration ──────────────────────────────────────────────────
 
 const INDEXIFY_API_KEY = process.env.INDEXIFY_API_KEY || "";
 const INDEXIFY_BASE_URL = process.env.INDEXIFY_BASE_URL || "https://api.indexify.ai";
+const INDEXIFY_AUTH_BASE_URL = process.env.INDEXIFY_AUTH_BASE_URL || INDEXIFY_BASE_URL;
 const TRANSPORT = process.env.MCP_TRANSPORT || "sse"; // "sse" or "stdio"
 const PORT = parseInt(process.env.PORT || "3100", 10);
 
@@ -32,6 +34,11 @@ const client = new IndexifyClient({
   apiKey: INDEXIFY_API_KEY,
 });
 
+const authClient = new IndexifyAuthClient({
+  baseUrl: INDEXIFY_AUTH_BASE_URL,
+  apiKey: INDEXIFY_API_KEY,
+});
+
 // ── MCP Server ─────────────────────────────────────────────────────
 
 const server = new McpServer({
@@ -40,19 +47,166 @@ const server = new McpServer({
 });
 
 // ════════════════════════════════════════════════════════════════════
+//  SERVER INSTRUCTION PROMPT
+// ════════════════════════════════════════════════════════════════════
+
+server.prompt(
+  "indexify_workflow",
+  "Recommended workflow for using the Indexify MCP server. Read this first before calling any tools.",
+  {},
+  async () => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `# Indexify MCP Server — Recommended Workflow
+
+## Step 1: Resolve the user
+Call \`get_or_create_user\` with the user's email address. This returns a userId.
+Always do this first — the userId is needed to scope all subsequent operations to the correct user.
+
+## Step 2: Pass userId on all calls
+Include the userId on every tool call that accepts it. This ensures each user's documents,
+knowledge bases, and queries are isolated from other users.
+
+## Step 3: Organize with knowledge bases
+Call \`create_knowledge_base\` to create collections for organizing documents
+(e.g. "Financial Documents", "Receipts", "Research Papers").
+
+## Step 4: Upload files or embed text
+- Use \`upload_file_base64\` to upload PDFs, images, Word docs, spreadsheets, or scanned documents.
+  Indexify performs layout-aware extraction and OCR — always send the original binary file.
+- Use \`embed_text\` for raw text content that doesn't come from a file.
+- Optionally pass knowledgeBaseIds to add content to knowledge bases immediately.
+
+## Step 5: Query with natural language
+Use the \`query\` tool to ask questions across your documents. You can scope queries to
+specific knowledge bases, files, or tags. The query tool performs semantic search and
+optionally generates an AI-synthesized answer using RAG.
+
+## Key principles
+- Always resolve the user first with get_or_create_user
+- Always pass userId to keep data isolated per user
+- Upload real files (not extracted text) to get the best extraction quality
+- Use knowledge bases to organize and scope queries`,
+        },
+      },
+    ],
+  })
+);
+
+// ════════════════════════════════════════════════════════════════════
+//  USER MANAGEMENT TOOLS
+// ════════════════════════════════════════════════════════════════════
+
+server.tool(
+  "get_or_create_user",
+  "The first tool to call before any other operation. Resolves or creates a user by email and returns their userId, which should be passed to all subsequent tools to keep each user's data isolated.",
+  {
+    email: z.string().describe("The user's email address"),
+  },
+  async ({ email }) => {
+    const result = await authClient.getOrCreateUser(email);
+    const status = result.created ? "Created new user" : "Found existing user";
+    return {
+      content: [{ type: "text", text: `${status}. User ID: ${result.userId}` }],
+    };
+  }
+);
+
+server.tool(
+  "create_user",
+  "Create a new user in Indexify. Returns the created user object with an id field. Requires user:write scope.",
+  {
+    firstName: z.string().optional().describe("User's first name"),
+    surname: z.string().optional().describe("User's surname"),
+    email: z.string().optional().describe("User's email address"),
+    phoneNumber: z.string().optional().describe("User's phone number"),
+    password: z.string().optional().describe("User's password"),
+    roles: z.array(z.string()).optional().describe("Roles to assign to the user"),
+    signUpVerificationRequired: z.boolean().optional().describe("Whether email verification is required"),
+    additionalInformation: z.string().optional().describe("Additional info as JSON string"),
+  },
+  async ({ firstName, surname, email, phoneNumber, password, roles, signUpVerificationRequired, additionalInformation }) => {
+    const result = await authClient.createUser({
+      firstName,
+      surname,
+      contactInfo: { email, phoneNumber },
+      password,
+      roles,
+      signUpVerificationRequired,
+      additionalInformation: additionalInformation ? JSON.parse(additionalInformation) : undefined,
+    });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "list_users",
+  "List users in Indexify. Can filter by email, phone, or userId. Requires user:read scope.",
+  {
+    email: z.string().optional().describe("Filter by email address"),
+    phone: z.string().optional().describe("Filter by phone number"),
+    userId: z.string().optional().describe("Filter by user ID"),
+    skip: z.number().optional().describe("Pagination offset"),
+    limit: z.number().optional().describe("Max results"),
+  },
+  async ({ email, phone, userId, skip, limit }) => {
+    const result = await authClient.listUsers({ email, phone, userId, skip, limit });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "update_user",
+  "Update an existing user's details. Requires user:write scope.",
+  {
+    id: z.string().describe("The user ID to update"),
+    firstName: z.string().optional().describe("New first name"),
+    surname: z.string().optional().describe("New surname"),
+    email: z.string().optional().describe("New email address"),
+    phoneNumber: z.string().optional().describe("New phone number"),
+    roles: z.array(z.string()).optional().describe("New roles"),
+  },
+  async ({ id, firstName, surname, email, phoneNumber, roles }) => {
+    const result = await authClient.updateUser(id, {
+      firstName,
+      surname,
+      contactInfo: { email, phoneNumber },
+      roles,
+    });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "delete_user",
+  "Delete a user from Indexify. Requires user:write scope.",
+  {
+    id: z.string().describe("The user ID to delete"),
+  },
+  async ({ id }) => {
+    await authClient.deleteUser(id);
+    return { content: [{ type: "text", text: "User deleted." }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════
 //  KNOWLEDGE BASE TOOLS
 // ════════════════════════════════════════════════════════════════════
 
 server.tool(
   "list_knowledge_bases",
-  "List all knowledge bases. A knowledge base is a collection of documents that can be queried together using RAG.",
+  "List all knowledge bases. A knowledge base is a collection of documents that can be queried together using RAG. Pass a userId to scope results to a specific user's data.",
   {
     search: z.string().optional().describe("Search term to filter knowledge bases by name"),
     skip: z.number().optional().describe("Number of results to skip for pagination"),
     limit: z.number().optional().describe("Maximum number of results to return"),
+    userId: z.string().optional().describe("Scope to a specific user's knowledge bases"),
   },
-  async ({ search, skip, limit }) => {
-    const result = await client.listKnowledgeBases({ search, skip, limit });
+  async ({ search, skip, limit, userId }) => {
+    const result = await client.listKnowledgeBases({ search, skip, limit, userId });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -156,16 +310,17 @@ server.tool(
 
 server.tool(
   "list_files",
-  "List all uploaded files. Can filter by tag, status, or search term.",
+  "List all uploaded files. Can filter by tag, status, or search term. Pass a userId to scope results to a specific user's files.",
   {
     tag: z.string().optional().describe("Filter by tag"),
     status: z.string().optional().describe("Filter by status (e.g. 'embedded', 'processing', 'error')"),
     search: z.string().optional().describe("Search term"),
     skip: z.number().optional().describe("Pagination offset"),
     limit: z.number().optional().describe("Max results"),
+    userId: z.string().optional().describe("Scope to a specific user's files"),
   },
-  async ({ tag, status, search, skip, limit }) => {
-    const result = await client.listFiles({ tag, status, search, skip, limit });
+  async ({ tag, status, search, skip, limit, userId }) => {
+    const result = await client.listFiles({ tag, status, search, skip, limit, userId });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -183,8 +338,39 @@ server.tool(
 );
 
 server.tool(
+  "upload_file_base64",
+  "Upload a file to Indexify from base64-encoded content. Supports PDFs, images (JPG, PNG, TIFF, BMP, WebP, GIF), Word docs (DOC, DOCX), spreadsheets (XLS, XLSX, CSV), presentations (PPTX), and scanned documents. Indexify performs layout-aware extraction and OCR on uploaded files — always send the original binary file rather than pre-extracted text to get the best quality results.",
+  {
+    fileBase64: z.string().describe("The base64-encoded file content"),
+    fileName: z.string().describe("The file name with extension (e.g. 'bank-statement.pdf')"),
+    userId: z.string().describe("The Indexify user ID (required). Call get_or_create_user first to obtain this."),
+    tags: z.array(z.string()).optional().describe("Tags to categorize the file"),
+    metadata: z.string().optional().describe("Additional metadata as a string"),
+    knowledgeBaseIds: z
+      .array(z.string())
+      .optional()
+      .describe("Knowledge base IDs to immediately add this file to"),
+    folderId: z.string().optional().describe("Folder ID to place the file in"),
+  },
+  async ({ fileBase64, fileName, userId, tags, metadata, knowledgeBaseIds, folderId }) => {
+    const fileId = await client.uploadFileBase64({
+      fileBase64,
+      fileName,
+      tags,
+      metadata,
+      knowledgeBaseIds,
+      folderId,
+      userId,
+    });
+    return {
+      content: [{ type: "text", text: `File uploaded successfully. File ID: ${fileId}` }],
+    };
+  }
+);
+
+server.tool(
   "embed_text",
-  "Ingest raw text content into Indexify. The text will be chunked, embedded, and made queryable. Returns a file ID. Optionally add it directly to knowledge bases.",
+  "Ingest raw text content into Indexify. The text will be chunked, embedded, and made queryable. Returns a file ID. Optionally add it directly to knowledge bases. Pass a userId to scope this content to a specific user.",
   {
     text: z.string().describe("The text content to embed"),
     title: z.string().optional().describe("A title for this text content"),
@@ -195,9 +381,10 @@ server.tool(
       .optional()
       .describe("Knowledge base IDs to immediately add this content to"),
     correlationId: z.string().optional().describe("External correlation ID for tracking"),
+    userId: z.string().optional().describe("Scope to a specific user's data"),
   },
-  async ({ text, title, tags, metadata, knowledgeBaseIds, correlationId }) => {
-    const fileId = await client.embedText({ text, title, tags, metadata, knowledgeBaseIds, correlationId });
+  async ({ text, title, tags, metadata, knowledgeBaseIds, correlationId, userId }) => {
+    const fileId = await client.embedText({ text, title, tags, metadata, knowledgeBaseIds, correlationId, userId });
     return {
       content: [{ type: "text", text: `Text embedded successfully. File ID: ${fileId}` }],
     };
@@ -336,7 +523,7 @@ server.tool(
 
 server.tool(
   "query",
-  "Query your documents using natural language. This performs semantic search across your embedded documents and optionally generates an AI answer using RAG. You can scope the query to a specific knowledge base, specific files, or tags.",
+  "Query your documents using natural language. This performs semantic search across your embedded documents and optionally generates an AI answer using RAG. You can scope the query to a specific knowledge base, specific files, or tags. Pass a userId to scope the query to a specific user's documents.",
   {
     input: z.string().describe("The natural language question or search query"),
     knowledgeBaseId: z
@@ -369,8 +556,9 @@ server.tool(
       .describe(
         "LLM model for answer generation. Options: gemini-2.0-flash, gemini-2.5-flash, gpt-5, gpt-4o, claude-sonnet-4-6, claude-haiku-4-5, etc."
       ),
+    userId: z.string().optional().describe("Scope the query to a specific user's documents"),
   },
-  async ({ input, knowledgeBaseId, fileIds, tags, includeAnswer, includeSources, includeAnalysis, model }) => {
+  async ({ input, knowledgeBaseId, fileIds, tags, includeAnswer, includeSources, includeAnalysis, model, userId }) => {
     const result = await client.queryEmbeddings({
       input,
       knowledgeBaseId,
@@ -380,6 +568,7 @@ server.tool(
       includeSources,
       includeAnalysis,
       model,
+      userId,
     });
 
     let text = "";
@@ -404,12 +593,13 @@ server.tool(
 
 server.tool(
   "list_folders",
-  "List all folders. Folders help organize files hierarchically.",
+  "List all folders. Folders help organize files hierarchically. Pass a userId to scope results to a specific user's folders.",
   {
     parentFolderId: z.string().optional().describe("Parent folder ID to list children of"),
+    userId: z.string().optional().describe("Scope to a specific user's folders"),
   },
-  async ({ parentFolderId }) => {
-    const result = await client.listFolders({ parentFolderId });
+  async ({ parentFolderId, userId }) => {
+    const result = await client.listFolders({ parentFolderId, userId });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -442,15 +632,16 @@ server.tool(
 
 server.tool(
   "list_files_and_folders",
-  "List files and folders together, optionally within a parent folder. Shows the full file tree.",
+  "List files and folders together, optionally within a parent folder. Shows the full file tree. Pass a userId to scope results to a specific user's data.",
   {
     parentId: z.string().optional().describe("Parent folder ID (omit for root)"),
     status: z.string().optional().describe("Filter files by status"),
     skip: z.number().optional().describe("Pagination offset"),
     limit: z.number().optional().describe("Max results"),
+    userId: z.string().optional().describe("Scope to a specific user's data"),
   },
-  async ({ parentId, status, skip, limit }) => {
-    const result = await client.getFilesAndFolders({ parentId, status, skip, limit });
+  async ({ parentId, status, skip, limit, userId }) => {
+    const result = await client.getFilesAndFolders({ parentId, status, skip, limit, userId });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   }
 );
@@ -506,6 +697,7 @@ async function main() {
       console.log(`   Messages endpoint: http://localhost:${PORT}/messages`);
       console.log(`   Health check: http://localhost:${PORT}/health`);
       console.log(`   Connected to: ${INDEXIFY_BASE_URL}`);
+      console.log(`   Auth API: ${INDEXIFY_AUTH_BASE_URL}`);
     });
   }
 }
