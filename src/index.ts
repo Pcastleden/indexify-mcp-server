@@ -659,7 +659,11 @@ async function main() {
   } else {
     // Remote SSE mode — for Dreamer, web clients, etc.
     const app = express();
-    app.use(express.json());
+    // Only parse JSON for non-MCP message routes — the SSE transport reads the raw body itself
+    app.use((req, res, next) => {
+      if (req.path === "/messages") return next();
+      express.json()(req, res, next);
+    });
 
     // Health check
     app.get("/health", (_req, res) => {
