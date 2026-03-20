@@ -861,12 +861,19 @@ async function main() {
     const sessions: Record<string, { server: McpServer; transport: SSEServerTransport }> = {};
 
     app.get("/sse", async (req, res) => {
+      // Keep-alive headers to prevent proxy/load-balancer from closing the SSE stream
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no"); // nginx/Railway proxy buffering off
+
       const transport = new SSEServerTransport("/messages", res);
       const sessionId = transport.sessionId;
       const server = createServer();
       sessions[sessionId] = { server, transport };
+      console.log(`[SSE] Session ${sessionId} connected (${Object.keys(sessions).length} active)`);
 
       res.on("close", () => {
+        console.log(`[SSE] Session ${sessionId} disconnected`);
         server.close().catch(() => {});
         delete sessions[sessionId];
       });
@@ -878,6 +885,7 @@ async function main() {
       const sessionId = req.query.sessionId as string;
       const session = sessions[sessionId];
       if (!session) {
+        console.error(`[POST /messages] No session for ${sessionId}. Active sessions: ${Object.keys(sessions).join(", ") || "none"}`);
         res.status(400).json({ error: "No active SSE session for this sessionId" });
         return;
       }
